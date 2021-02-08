@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.9
 # -*- coding: utf-8 -*-
 
 # A simple chat client for matrix.
@@ -50,6 +50,28 @@ VK_POLLING_VERSION = '3'
 
 currentchat = {}
 
+chatEquality = {}
+
+def retrieve_vk_message_by_matrix_id(mtxId):
+  save_data(data)
+  if mtxId in data["equality"]:
+    return data["equality"][mtxId]
+  else: 
+    return None
+
+def retrieve_matrix_message_by_vk_id(vkId):
+  result = None
+  save_data(data)
+  for mtxId, Id in data["equality"].items():
+    if Id == vkId:
+      result = mtxId
+      break
+  return result
+
+def store_vk_message_by_matrix_id(vkId, mtxId):
+  data["equality"][mtxId] = vkId
+  save_data(data)
+
 def process_command(user,room,cmd,formated_message=None,format_type=None,reply_to_id=None,file_url=None,file_type=None):
   global client
   global log
@@ -60,17 +82,21 @@ def process_command(user,room,cmd,formated_message=None,format_type=None,reply_t
     session_data_room=None
     session_data_vk=None
     session_data_user=None
+    vkReplyTo=None
 
     if reply_to_id!=None and format_type=="org.matrix.custom.html" and formated_message!=None:
       # разбираем, чтобы получить исходное сообщение и ответ
-      log.debug("formated_message=%s"%formated_message)
+      vkReplyTo = retrieve_vk_message_by_matrix_id(reply_to_id)
       source_message=re.sub('<mx-reply><blockquote>.*<\/a><br>','', formated_message)
       source_message=re.sub('<mx-reply><blockquote>.*<\/a><br />','', source_message)
       source_message=re.sub('</blockquote></mx-reply>.*','', source_message)
       source_cmd=re.sub(r'.*</blockquote></mx-reply>','', formated_message.replace('\n',''))
       log.debug("source=%s"%source_message)
       log.debug("cmd=%s"%source_cmd)
-      cmd="> %s\n\n%s"%(source_message,source_cmd)
+      if vkReplyTo == None:
+        cmd="> %s\n\n%s"%(source_message,source_cmd)
+      else:
+        cmd=source_cmd
 
     if re.search('^@%s:.*'%conf.username, user.lower()) is not None:
       # отправленное нами же сообщение - пропускаем:
@@ -83,11 +109,6 @@ def process_command(user,room,cmd,formated_message=None,format_type=None,reply_t
       data["users"][user]["rooms"]={}
     if "vk" not in data["users"][user]:
       data["users"][user]["vk"]={}
-      data["users"][user]["vk"]["exit"]=False
-      data["users"][user]["vk"]["ts"]=0
-      data["users"][user]["vk"]["pts"]=0
-      data["users"][user]["vk"]["ts_polling"]=0
-      data["users"][user]["vk"]["ts_check_poll"]=0
     if room not in data["users"][user]["rooms"]:
       data["users"][user]["rooms"][room]={}
       data["users"][user]["rooms"][room]["state"]="listen_command"
@@ -171,7 +192,7 @@ def process_command(user,room,cmd,formated_message=None,format_type=None,reply_t
             return False
       else:
         # отправка текста:
-        message_id=vk_send_text(session_data_vk["vk_id"],dialog["id"],cmd,dialog["type"])
+        message_id=vk_send_text(session_data_vk["vk_id"],dialog["id"],cmd,dialog["type"], None, vkReplyTo)
         if message_id == None:
           log.error("error vk_send_text() for user %s"%user)
           send_message(room,"не смог отправить сообщение в ВК - ошибка АПИ")
@@ -189,7 +210,7 @@ def process_command(user,room,cmd,formated_message=None,format_type=None,reply_t
         log.error("save_message_id()")
         bot_system_message(user,'Ошибка: не смог сохранить идентификатор отправленного сообщения - внутренняя ошибка бота')
         return False
-      return True
+      return message_id
 
     # Комната управления:
     # в любом состоянии отмена - всё отменяет:
@@ -575,15 +596,21 @@ def get_new_vk_messages_v2(user):
       # ищем нужные нам события (новые сообщения), типы всех событий описаны вот тут: https://vk.com/dev/using_longpoll_2
       # 4 - Добавление нового сообщения. 
       # 5 - Редактирование сообщения. 
+      # 8 - Друг стал онлайн
+      # 9 - Друг стал оффлайн
       # 51 - Один из параметров (состав, тема) беседы $chat_id были изменены. $self — 1 или 0 (вызваны ли изменения самим пользователем). 
       # 52 - Изменение информации чата $peer_id с типом $type_id, $info — дополнительная информация об изменениях, зависит от типа события.
+      # 61 - Набор текста в ЛС
       ts=ret["ts"]
       new_events=False
       for update in ret["updates"]:
         if update[0]==4 \
           or update[0]==5 \
+          or update[0]==8 \
+          or update[0]==9 \
           or update[0]==51 \
-          or update[0]==52:
+          or update[0]==52 \
+          or update[0]==61:
           new_events=True
           log.info("getting info about new events - try get events...")
           break
@@ -604,6 +631,17 @@ def get_new_vk_messages_v2(user):
         log.info("get command to close thread for user %s - exit from thread..."%user)
         return None
 
+    #Тут можно начинать обрабатывать онлайн-оффлайн и печать
+
+    online_status=[]
+    typing_status=[]
+    for update in ret["updates"]:
+      if update[0]==8:
+        online_status.append({"id":(update[1]*-1), "status": "online"})
+      if update[0]==9:
+        online_status.append({"id":(update[1]*-1), "status": "offline"})
+      if update[0]==61:
+        typing_status.append({"id":(update[1])})
 
     # Проверка на необходимость выйти из потока:
     exit_flag=False
@@ -620,10 +658,10 @@ def get_new_vk_messages_v2(user):
 
     # получаем данные событий:
     log.debug("session=")
-    log.debug(session)
+    #log.debug(session)
     session = get_session(data["users"][user]["vk"]["vk_id"])
-    log.debug("session=")
-    log.debug(session)
+    #log.debug("session=")
+    #log.debug(session)
 
     api = vk.API(session, v=VK_API_VERSION)
     try:
@@ -632,7 +670,7 @@ def get_new_vk_messages_v2(user):
       #new = api.execute(code='return API.messages.getLongPollHistory({});'.format(ts_pts))
       log.debug("try exec api.messages.getLongPollHistory()")
       new = api.messages.getLongPollHistory(
-          ts=data["users"][user]["vk"]["ts"],\
+          ts=data["users"][user]["vk"]["ts_polling"],\
           pts=data["users"][user]["vk"]["pts"],\
           lp_version=VK_POLLING_VERSION\
         )
@@ -666,11 +704,13 @@ def get_new_vk_messages_v2(user):
     log.debug("release lock() after access global data")
     count = msgs["count"]
 
-    res = None
+    res = {}
+
+    res["online_status"]=online_status #Добавляем онлайн статусы в возвращаемое, чтобы потом посылать информацию о них
+    res["typing_status"]=typing_status
     if count == 0:
       pass
     else:
-      res={}
       res["messages"] = msgs["items"]
       # при разговоре с админами иногда может не быть профилей O_o
       if "profiles" in new:
@@ -802,7 +842,7 @@ def info_extractor(info):
     log.error("exception at execute info_extractor()")
     return None
 
-def vk_send_text(vk_id, chat_id, message, chat_type="user", forward_messages=None):
+def vk_send_text(vk_id, chat_id, message, chat_type="user", forward_messages=None, replyTo=None):
   global log
   message_id=None
   try:
@@ -811,9 +851,9 @@ def vk_send_text(vk_id, chat_id, message, chat_type="user", forward_messages=Non
     session = get_session(vk_id)
     api = vk.API(session, v=VK_API_VERSION)
     if chat_type!="user":
-      message_id=api.messages.send(peer_id=chat_id, random_id=random_id,  message=message, forward_messages=forward_messages)
+      message_id=api.messages.send(peer_id=chat_id, random_id=random_id,  message=message, forward_messages=forward_messages, reply_to=replyTo)
     else:
-      message_id=api.messages.send(user_id=chat_id, random_id=random_id, message=message, forward_messages=forward_messages)
+      message_id=api.messages.send(user_id=chat_id, random_id=random_id, message=message, forward_messages=forward_messages, reply_to=replyTo)
     # message_id содержит ID отправленного сообщения
   except Exception as e:
     log.error(get_exception_traceback_descr(e))
@@ -1418,6 +1458,8 @@ def load_data():
         log.warning("Битый файл сессии - сброс")
         reset=True
       else:
+        if not "equality" in data:
+          data["equality"] = {}
         # успешно загрузили файл состояния - он в хорошем состоянии - сохраняем его как бэкап:
         try:
           backup_name=conf.data_file+'.backup'
@@ -1559,7 +1601,7 @@ def create_room(matrix_uid, room_name, avatar_data=None):
 
   return room.room_id;
 
-def send_html(room_id,html):
+def send_html(room_id,html, useType=False):
   global client
   global log
   log.debug("=start function=")
@@ -1576,7 +1618,10 @@ def send_html(room_id,html):
       log.error("Couldn't find room.")
       return False
   try:
-    room.send_html(html)
+    event=room.send_html(html)
+    if useType:
+      log.debug(event)
+      return event
   except Exception as e:
     log.error(get_exception_traceback_descr(e))
     log.error("Unknown error at send message '%s' to room '%s'"%(html,room_id))
@@ -1664,6 +1709,42 @@ def send_notice(room_id,message):
     return False
   return True
 
+def send_typing_event(room_id):
+  global client
+  global log
+  log.debug("=start function=")
+  room=None
+  try:
+    client.api.send_message_event(room_id,"m.typing", {'user_ids': ['@kokoko_vktransport:matrix.org']})
+  except Exception as e:
+    log.error(get_exception_traceback_descr(e))
+    log.error("Unknown error at send typing event to room '%s'"%room_id)
+    return False
+  return True
+
+
+def set_room_topic(room_id,message):
+  global client
+  global log
+  log.debug("=start function=")
+  room=None
+  try:
+    room = client.join_room(room_id)
+  except MatrixRequestError as e:
+    print(e)
+    if e.code == 400:
+      log.error("Room ID/Alias in the wrong format")
+      return False
+    else:
+      log.error("Couldn't find room.")
+      return False
+  try:
+    room.set_room_topic(message)
+  except Exception as e:
+    log.error(get_exception_traceback_descr(e))
+    log.error("Unknown error at set room topic '%s' to room '%s'"%(message,room_id))
+    return False
+  return True
 
 # Called when a message is recieved.
 def on_message(event):
@@ -1679,7 +1760,7 @@ def on_message(event):
     file_type=None
 
     log.debug("new MATRIX message:")
-    log.debug(json.dumps(event, indent=4, sort_keys=True,ensure_ascii=False))
+    #log.debug(json.dumps(event, indent=4, sort_keys=True,ensure_ascii=False))
     if event['type'] == "m.room.member":
         # join:
         if event['content']['membership'] == "join":
@@ -1735,18 +1816,21 @@ def on_message(event):
         log.debug("try lock before process_command()")
         with lock:
           log.debug("success lock before process_command()")
-          if process_command(\
-              event['sender'],\
-              event['room_id'],\
-              event['content']["body"],\
-              formated_message=formatted_body,\
-              format_type=format_type,\
-              reply_to_id=reply_to_id,\
-              file_url=file_url,\
-              file_type=file_type\
-            ) == False:
+          result = process_command(\
+            event['sender'],\
+            event['room_id'],\
+            event['content']["body"],\
+            formated_message=formatted_body,\
+            format_type=format_type,\
+            reply_to_id=reply_to_id,\
+            file_url=file_url,\
+            file_type=file_type\
+          ) 
+          if result == False:
             log.error("error process command: '%s'"%event['content']["body"])
             return False
+          if event["sender"] != "@vk-bot:neofetch.win":
+            store_vk_message_by_matrix_id(result, event["event_id"])
         log.debug("success lock() before access global data")
     else:
       log.warning("unknown type of event:")
@@ -1766,7 +1850,7 @@ def on_event(event):
   log.debug("=start function=")
   print("event:")
   print(event)
-  print(json.dumps(event, indent=4, sort_keys=True,ensure_ascii=False))
+  #print(json.dumps(event, indent=4, sort_keys=True,ensure_ascii=False))
 
 def on_invite(room, event):
   global client
@@ -1781,7 +1865,7 @@ def on_invite(room, event):
     print(room)
     print("event_data:")
     print(event)
-    print(json.dumps(event, indent=4, sort_keys=True,ensure_ascii=False))
+    #print(json.dumps(event, indent=4, sort_keys=True,ensure_ascii=False))
 
   # Просматриваем сообщения:
   for event_item in event['events']:
@@ -1808,7 +1892,7 @@ def on_invite(room, event):
         if allow == True:
           # Приглашение вступить в комнату:
           room = client.join_room(room)
-          room.send_text("Спасибо за приглашение! Недеюсь быть Вам полезным. :-)")
+          room.send_text("Спасибо за приглашение! Надеюсь быть Вам полезным. :-)")
           room.send_text("Для справки по доступным командам - наберите: '!help' (или '!?', или '!h')")
           log.info("New user: '%s'"%user)
           # Прописываем системную группу для пользователя (группа, в которую будут сыпаться системные сообщения от бота и где он будет слушать команды):
@@ -2076,6 +2160,7 @@ def start_vk_polls(check_iteration):
   except Exception as e:
     log.error(get_exception_traceback_descr(e))
     log.error("exception at execute start_vk_polls()")
+    data["users"][user]["vk"]["exit"] = True
     return 0
 
 def get_name_from_url(url):
@@ -2126,8 +2211,8 @@ def send_file_to_matrix(room,sender_name,attachment):
 
     if sender_name!=None:
       file_name=sender_name+' прислал файл: '+file_name
-
-    if matrix_send_file(room,mxc_url,file_name,mimetype,size) == False:
+    event = matrix_send_file(room,mxc_url,file_name,mimetype,size)
+    if event == False:
       log.error("send file to room")
       return False
   except Exception as e:
@@ -2135,19 +2220,23 @@ def send_file_to_matrix(room,sender_name,attachment):
     log.error("json of attachment:")
     log.error(json.dumps(attachment, indent=4, sort_keys=True,ensure_ascii=False))
     return False
-  return True
+  return event
 
 def create_reply_forward_text_for_matrix(user,fwd):
   global log
   global data
+  post=""
   try:
+    if "fwd_messages" in fwd and fwd["fwd_messages"]!=[]:
+      for msg in fwd["fwd_messages"]:
+        post+=create_reply_forward_text_for_matrix(user, msg)
     fwd_uid=fwd["from_id"]
     fwd_text=fwd["text"]
     user_profile=get_user_profile_by_uid(user,fwd_uid)
     fwd_user_name=fwd_uid
     if user_profile!=None:
-      fwd_user_name=user_profile["first_name"] + " " + user_profile["last_name"]
-    text="<blockquote>\n<p>В ответ на реплику от <strong>%(fwd_user)s</strong>:</p><p>%(fwd_text)s</p>\n" % {"fwd_user":fwd_user_name, "fwd_text":fwd_text}
+      fwd_user_name="<a href=\"https://vk.com/id%s\">"%(user_profile["id"])+ user_profile["first_name"] + " " + user_profile["last_name"] + "</a>"
+    text="<blockquote>\n<p>Пересланное сообщение от <strong>%(fwd_user)s</strong>:</p><p>%(fwd_text)s</p>\n" % {"fwd_user":fwd_user_name, "fwd_text":fwd_text} + post
     # если это ответ на вложения, то добавляем их как ссылки:
     descr="вложение"
     if "attachments" in fwd:
@@ -2171,7 +2260,7 @@ def create_reply_forward_text_for_matrix(user,fwd):
           descr="документ"
           url=attachment["doc"]['url']
         if url!=None:
-          text+="<p>%(descr)s: %(url)s</p>\n" % {"url":url,"descr":descr}
+          text+="<p><a href=\"%(url)s\">%(descr)s</a></p>\n" % {"url":url, "descr":descr}
     if "geo" in fwd:
       geo=fwd["geo"]
       if geo["type"]=='point':
@@ -2331,7 +2420,8 @@ def send_photo_to_matrix(room,sender_name,attachment):
     if sender_name!=None:
       file_name=sender_name+' прислал изображение: '+file_name
 
-    if matrix_send_image(room,mxc_url,file_name,mimetype,height,width,size) == False:
+    event = matrix_send_image(room,mxc_url,file_name,mimetype,height,width,size)
+    if event == False:
       log.error("send file to room")
       return False
   except Exception as e:
@@ -2340,7 +2430,15 @@ def send_photo_to_matrix(room,sender_name,attachment):
     log.error("json of attachment:")
     log.error(json.dumps(attachment, indent=4, sort_keys=True,ensure_ascii=False))
     return False
-  return True
+  return event
+
+attachmentHuman = {
+  "doc":"Документ",
+  "audio":"Аудио",
+  "photo":"Фотография",
+  "audio_message":"Голосове сообщение",
+  "video":"Видео"
+}
 
 def send_wall_to_matrix(room,sender_name,attachment):
   global log
@@ -2349,7 +2447,7 @@ def send_wall_to_matrix(room,sender_name,attachment):
     text=""
     if sender_name!=None:
       text+="<p><strong>%(sender_name)s</strong>:</p>\n"%{"sender_name":sender_name}
-    text+="<blockquote>\n<p>Запись на стене:</p>\n<p>%(wall_text)s</p>\n" % {"wall_text":attachment["wall"]["text"]}
+    text+="<blockquote>\n<p><a href='https://vk.com/wall%(from_id)s_%(post_id)s'>Запись на стене</a>:</p>\n<p>%(wall_text)s</p>\n" % {"from_id":attachment["wall"]["from_id"],"post_id":attachment["wall"]["id"],"wall_text":attachment["wall"]["text"]}
     # если на стене были вложения, то добавляем их как ссылки:
     if "attachments" in attachment["wall"]:
       for attachment in attachment["wall"]["attachments"]:
@@ -2370,9 +2468,10 @@ def send_wall_to_matrix(room,sender_name,attachment):
         elif attachment['type']=="doc":
           url=attachment["doc"]['url']
         if url!=None:
-          text+="<p>вложение: %(url)s</p>\n" % {"url":url}
+          text+="<p><a href='%(url)s'>%(type)s</a> </p>\n" % {"url":url, "type":attachmentHuman[attachment['type']]}
     text+="</blockquote>\n"
-    if send_html(room,text)==False:
+    event = send_html(room,text)
+    if event==False:
       log.error("send_html()")
       return False
   except Exception as e:
@@ -2381,7 +2480,7 @@ def send_wall_to_matrix(room,sender_name,attachment):
     log.error("json of attachment:")
     log.error(json.dumps(attachment, indent=4, sort_keys=True,ensure_ascii=False))
     return False
-  return True
+  return event
 
 def send_link_to_matrix(room,sender_name,attachment):
   global log
@@ -2415,51 +2514,56 @@ def send_link_to_matrix(room,sender_name,attachment):
     return False
   return True
 
-def send_video_to_matrix(room,sender_name,attachment):
+def send_video_to_matrix(room,sender_name,attachment, user):
   global log
+  global data
   ret=False
+  src=None
+  vidSuc=False
+  session = get_session(data["users"][user]["vk"]["vk_id"])
+  api = vk.API(session, v=VK_API_VERSION)
+  videoInfo = api.video.get(videos="%s_%s"%(attachment["video"]["owner_id"],attachment["video"]["id"]))["items"][0]
+  log.debug(videoInfo)
+  if videoInfo != None:
+    if "files" in videoInfo:
+      if "mp4_480" in videoInfo["files"]:
+        src=videoInfo["files"]["mp4_480"]
+        vidSuc=True
+      elif "mp4_360" in videoInfo["files"]:
+        src=videoInfo["files"]["mp4_360"]
+        vidSuc=True
+      elif "mp4_240" in videoInfo["files"]:
+        src=videoInfo["files"]["mp4_240"]
+        vidSuc=True
+      elif "external" in videoInfo["files"]:
+        src=videoInfo["files"]["external"]
   try:
     log.debug("=start function=")
-    src=None
-    if 'first_frame_320' in attachment["video"]:
-      src=attachment["video"]['first_frame_320']
-    elif 'photo_320' in attachment["video"]:
-      src=attachment["video"]['photo_320']
-
-    description=None
-    if 'description' in attachment["video"]:
-      description=attachment["video"]["description"]
-    
-    image_data=get_data_from_url(src)
-    if image_data==None:
-      log.error("get image from url: %s"%src)
-      return False
-
-    # TODO добавить определение типа:
-    mimetype="image/jpeg"
-    size=len(image_data)
-      
-    mxc_url=upload_file(image_data,mimetype)
-    if mxc_url == None:
-      log.error("uload file to matrix server")
-      return False
-    log.debug("send file 1")
-    if "title" in attachment["video"]:
-      file_name=attachment["video"]["title"]+"(превью видео).jpg"
+    if src==None:
+      mimetype="image/jpeg"
+      if 'first_frame_320' in attachment["video"]:
+        src=attachment["video"]['first_frame_320']
+      elif 'photo_320' in attachment["video"]:
+        src=attachment["video"]['photo_320']
     else:
-      file_name=get_name_from_url(src)
-
-    if sender_name!=None:
-      file_name=sender_name+' прислал изображение: '+file_name
-
-    if matrix_send_image(room,mxc_url,file_name,mimetype=mimetype,height=0,width=0,size=size) == False:
-      log.error("send file to room")
-      return False
-    video_url="https://vk.com/video%(owner_id)s_%(vid)s"%{"owner_id":attachment["video"]["owner_id"],"vid":attachment["video"]["id"]}
-    message="Ссылка на просмотр потокового видео: %s"%video_url
-    if description!=None:
-      message+="\nОписание: %s"%description
-    ret=send_message(room,message)
+      mimetype = "video/mp4"
+    description=None
+    if vidSuc:
+      fdata=get_data_from_url(src)
+      mxc_url=upload_file(fdata,mimetype)
+      matrix_send_video(room, mxc_url, sender_name)
+      log.debug(vidSuc)
+      log.debug(mimetype)
+      if 'description' in attachment["video"]:
+        description=attachment["video"]["description"]
+      video_url="https://vk.com/video%(owner_id)s_%(vid)s"%{"owner_id":attachment["video"]["owner_id"],"vid":attachment["video"]["id"]}
+      message="Видео: %s <a href=\"%s\">Ссылка на страницу видео</a>"%(attachment["video"]["title"], video_url)
+      if description!=None:
+        message+="<br><b>Описание:</b> %s"%description
+      ret=send_html(room,message)
+    else:
+      message="<b>%s</b>: Видео %s: %s %s"%(sender_name, attachment["video"]["platform"], attachment["video"]["title"], src)
+      ret=send_html(room,message)
   except Exception as e:
     log.error(get_exception_traceback_descr(e))
     log.error("exception at parse attachemt '%s': %s"%(attachment["type"],e))
@@ -2520,6 +2624,14 @@ def send_voice_to_matrix(room,sender_name,attachment):
     file_name="голосовое_сообщение.ogg"
     mimetype="audio/ogg"
     
+    if attachment["audio_message"]["transcript_state"]=="done": #Если прилетела расшифровка голосового
+      transcript="[%d]"%duration+attachment["audio_message"]["transcript"]
+      if send_notice(room,transcript) == False: #Просто шлём notice чтобы не путать с сообщениями и выходим.
+        log.error("send_notice(%s)"%text)
+        return False
+      return True
+    #TODO: Сделать как в Kate Mobile чтобы текст по окончанию расшифровки добавлялся к голосовому путём редактирования сообщения.
+
     audio_data=get_data_from_url(src)
     if audio_data==None:
       log.error("get voice from url: %s"%src)
@@ -2604,7 +2716,7 @@ def send_attachments(user,room,sender_name,attachments):
   global log
   try:
     log.debug("=start function=")
-    success_status=True
+    event=None
     for attachment in attachments:
       # Отправляем фото:
       if attachment["type"]=="photo":
@@ -2631,34 +2743,40 @@ def send_attachments(user,room,sender_name,attachments):
           success_status=False
       # Отправляем видео:
       elif attachment["type"]=="video":
-        if send_video_to_matrix(room,sender_name,attachment)==False:
+        event = send_video_to_matrix(room,sender_name,attachment, user)
+        if event ==False:
           log.error("send_video_to_matrix()")
           bot_system_message(user,"при разборе вложений с типом '%s' - произошли ошибки"%attachment["type"])
           success_status=False
       # документы:
       elif attachment["type"]=="doc":
         # иные прикреплённые документы:
-        if send_file_to_matrix(room,sender_name,attachment)==False:
+        event = send_file_to_matrix(room,sender_name,attachment)
+        if event ==False:
           log.error("send_file_to_matrix()")
           bot_system_message(user,"при разборе вложений с типом '%s' - произошли ошибки"%attachment["type"])
-          success_status=False
       # сообщение со стены:
       elif attachment["type"]=="wall":
-        if send_wall_to_matrix(room,sender_name,attachment)==False:
+        event = send_wall_to_matrix(room,sender_name,attachment)
+        if event==False:
           log.error("send_wall_to_matrix()")
           bot_system_message(user,"при разборе вложений с типом '%s' - произошли ошибки"%attachment["type"])
-          success_status=False
       # ссылка:
       elif attachment["type"]=="link":
         if send_link_to_matrix(room,sender_name,attachment)==False:
           log.error("send_link_to_matrix()")
           bot_system_message(user,"при разборе вложений с типом '%s' - произошли ошибки"%attachment["type"])
           success_status=False
+      elif attachment["type"]=="graffiti":
+        if send_graffiti_to_matrix(room,sender_name,attachment)==False:
+          log.error("send_photo_to_matrix()")
+          bot_system_message(user,"при разборе вложений с типом '%s' - произошли ошибки"%attachment["type"])
+          success_status=False
       else:
         log.error("unknown attachment type - skip. attachment type=%s"%attachment["type"])
         bot_system_message(user,"Из ВК пришёл неизвестный тип вложения (%s) для комнаты '%s'"%(attachment["type"],get_name_of_matrix_room(room)))
         send_message(room,"Из ВК пришёл неизвестный тип вложения (%s)"%attachment["type"])
-    return success_status
+    return event
   except Exception as e:
     log.error(get_exception_traceback_descr(e))
     log.error("exception in send_attachments()")
@@ -2666,6 +2784,10 @@ def send_attachments(user,room,sender_name,attachments):
     log.error("json of attachments:")
     log.error(json.dumps(attachment, indent=4, sort_keys=True,ensure_ascii=False))
     return False
+
+def send_graffiti_to_matrix(room, sender, attachment):
+  print("graffiti")
+
 
 def get_data_from_url(url,referer=None):
   global log
@@ -2682,6 +2804,28 @@ def get_data_from_url(url,referer=None):
     return None
   return data
 
+def matrix_send_video(room_id,mxc,sender):
+  name="Video from %s.mp4"%sender
+  try:
+    room = client.join_room(room_id)
+  except MatrixRequestError as e:
+    print(e)
+    if e.code == 400:
+      log.error("Room ID/Alias in the wrong format")
+      return False
+    else:
+      log.error("Couldn't find room.")
+      return False
+  try:
+    ret=room.send_video(mxc,name)
+  except MatrixRequestError as e:
+    print(e)
+    if e.code == 400:
+      log.error("ERROR send video with mxurl=%s"%mxc)
+      return False
+    else:
+      log.error("Couldn't send audio (unknown error) with mxurl=%s"%mxc)
+      return False
 
 def matrix_send_audio(room_id,url,name,mimetype="audio/mpeg",size=0,duration=0):
   global log
@@ -2755,7 +2899,7 @@ def matrix_send_image(room_id,url,name,mimetype,height=None,width=None,size=None
     else:
       log.error("Couldn't send image (unknown error) with mxurl=%s"%url)
       return False
-  return True
+  return ret
 
 def matrix_send_file(room_id,url,name,mimetype,size):
   global log
@@ -2928,6 +3072,12 @@ def get_photo_url_from_photo_attachment(attachment):
     log.error(json.dumps(attachment, indent=4, sort_keys=True,ensure_ascii=False))
     return None
 
+def create_matrix_format_reply_to_vk(mtxId, vkMessage, sendingUser, room_id, sender_id):
+  msg = "<mx-reply><blockquote><a href=\"https://matrix.to/#/%s/%s\">In reply to "%(room_id,mtxId)
+  msg+="%s:</a><br> %s</blockquote></mx-reply><br>"%(sendingUser,vkMessage)
+  return msg
+
+
 def proccess_vk_message(bot_control_room,room,user,sender_name,m):
   global data
   global lock
@@ -2979,10 +3129,23 @@ def proccess_vk_message(bot_control_room,room,user,sender_name,m):
       text+="<p>%s</p>\n" % m["text"]
     elif 'reply_message' in m and m['reply_message']!=[]:
       log.debug("1")
-      if sender_name!=None:
-        text+="<p><strong>%(sender_name)s</strong>:</p>\n"%{"sender_name":sender_name}
       # это ответ на сообщение - добавляем текст сообщения, на который дан ответ:
-      text+=create_reply_forward_text_for_matrix(user,m['reply_message'])
+      mtxReplyTo = retrieve_matrix_message_by_vk_id(m["reply_message"]["id"])
+      if mtxReplyTo != None:
+        fwd=m['reply_message']
+        fwd_uid=fwd["from_id"]
+        fwd_text=fwd["text"]
+        user_profile=get_user_profile_by_uid(user,fwd_uid)
+        fwd_user_name=fwd_uid
+        if user_profile!=None:
+          fwd_user_name=user_profile["first_name"] + " " + user_profile["last_name"]
+          text+=create_matrix_format_reply_to_vk(mtxReplyTo, fwd_text, "<b>%s</b>"%(fwd_user_name), room, user)
+        if sender_name!=None:
+          text+="<p><strong>%(sender_name)s</strong>:</p>\n"%{"sender_name":sender_name}
+      else:
+        if sender_name!=None:
+          text+="<p><strong>%(sender_name)s</strong>:</p>\n"%{"sender_name":sender_name}
+        text+=create_reply_forward_text_for_matrix(user,m["reply_message"])
       text+="<p>%s</p>\n" % m["text"]
     else:
       log.debug("1")
@@ -2992,9 +3155,11 @@ def proccess_vk_message(bot_control_room,room,user,sender_name,m):
         text=m["text"]
     log.debug("1")
 
-    if len(m["text"])>0:
+    if len(m["text"])>0 or m["fwd_messages"]!=[]:
       log.debug("send text='%s'"%text)
-      if send_html(room,text.replace('\n','<br>')) == True:
+      event = send_html(room,text.replace('\n','<br>'), True) 
+      if event != False:
+        store_vk_message_by_matrix_id(m["id"], event["event_id"])
         send_status=True
       else:
         bot_system_message(user,"Ошибка: не смог отправить сообщение из ВК в комнату: '%s' сообщение были от: %s"%(room,sender_name))
@@ -3016,15 +3181,41 @@ def proccess_vk_message(bot_control_room,room,user,sender_name,m):
         send_status=True
     # события в комнате:
     if "action" in m:
+      print(action)
       action=m["action"]
+      selfAction=(len(m["profiles"]) == 1)
       if action["type"]=="chat_kick_user":
-        if send_notice(room,"Пользователь %s вышел из комнаты"%sender_name) == False:
-          log.error("send_notice")
+        if selfAction: 
+          if send_notice(room,"Пользователь %s вышел из комнаты"%sender_name) == False:
+            log.error("send_notice")
+        else:
+          if send_notice(room,"Пользователь %s кикнул из комнаты пользователя%s %s"%(sender_name, m["profiles"][1]["first_name"], m["profiles"][1]["last_name"])) == False:
+            log.error("send_notice")
       elif action["type"]=="chat_invite_user":
-        if send_notice(room,"Пользователь %s вошёл в комнату"%sender_name) == False:
-          log.error("send_notice")
+        if selfAction:
+          if send_notice(room,"Пользователь %s вошёл в комнату"%sender_name) == False:
+            log.error("send_notice")
+        else: 
+          if send_notice(room,"Пользователь %s добавил в комнату пользователя%s %s"%(sender_name, m["profiles"][1]["first_name"], m["profiles"][1]["last_name"])) == False:
+            log.error("send_notice")
+      elif action["type"]=="chat_invite_user_by_link":
+        if send_notice(room,"Пользователь %s вошёл в комнату по ссылке"%sender_name) == False:
+            log.error("send_notice")
+      elif action["type"]=="chat_title_update":
+        if room.set_room_name(action["text"]) == False: #Хз зачем, ибо редко нужно, но пускай будет
+            log.error("send_notice")
+      #elif action["type"]=="chat_photo_update": #Ввести не так-то просто, ибо тут внезапно нужна сессия ВК, а сюда приходят уже приготовленные сообщения
+      #    user_photo_url=vk_get_user_photo_url(session, action["photo"]["photo_200"])
+      #    user_photo_image_data=None
+      #    if user_photo_url==None:
+      #      log.error("get user vk profile photo for user_id=%d"%cur_dialog["id"])
+      #    else:
+      #      user_photo_image_data=get_data_from_url(user_photo_url)
+      #      if user_photo_image_data==None:
+      #        log.error("get image from url: %s"%user_photo_url)
+
       else:
-        # TODO добавить обработчики других событий:
+        # TODO добавить обработчики других событий: (chat_photo_update, chat_photo_remove, chat_pin_message, chat_unpin_message)
         if send_notice(room,"Неизвестный тип события (%s) для пользователя %s"%(action["type"],sender_name)) == False:
           log.error("send_notice")
 
@@ -3040,10 +3231,10 @@ def proccess_vk_message(bot_control_room,room,user,sender_name,m):
     return send_status
   except Exception as e:
     log.error(get_exception_traceback_descr(e))
-    log.error("exceptions in proccess_vk_message()")
-    bot_system_message(user,"при разборе сообщения из ВК - произошли ошибки - не смог принять сообщение. Обратитесь к разработчику.")
-    log.error("json of vk_message:")
-    log.error(json.dumps(m, indent=4, sort_keys=True,ensure_ascii=False))
+    # log.error("exceptions in proccess_vk_message()")
+    # bot_system_message(user,"при разборе сообщения из ВК - произошли ошибки - не смог принять сообщение. Обратитесь к разработчику.")
+    # log.error("json of vk_message:")
+    # log.error(json.dumps(m, indent=4, sort_keys=True,ensure_ascii=False))
     return False
 
 def get_message_chat_type(conversations,peer_id):
@@ -3077,11 +3268,33 @@ def vk_receiver_thread(user):
 
     while True:
       log.debug("try exec get_new_vk_messages_v2(%s)"%user)
-      res=get_new_vk_messages_v2(user)
+      res=get_new_vk_messages_v2(user) #Теперь забирает и события об онлайн-оффлайн
       log.debug("end exec get_new_vk_messages_v2(%s)"%user)
       if res != None:
         log.debug("res=")
         log.debug(json.dumps(res, indent=4, sort_keys=True,ensure_ascii=False))
+
+
+        #TODO: ФАТАЛЬНЫЙ НЕДОСТАТОК - работает только по друзьям, а не просто по диалогам
+        for online_event in res["online_status"]:
+          for room in data["users"][user]["rooms"]:
+              if "cur_dialog" in data["users"][user]["rooms"][room] and online_event["id"]==data["users"][user]["rooms"][room]["cur_dialog"]["id"]:
+                if online_event["status"]=="online":
+                  if set_room_topic(room,"Онлайн") == False:
+                    log.error("set_room_topic(%s)"%text)
+                if online_event["status"]=="offline":
+                  if set_room_topic(room,"Оффлайн") == False:
+                    log.error("set_room_topic(%s)"%text)
+                continue
+        for typing_event in res["typing_status"]:
+          for room in data["users"][user]["rooms"]:
+              if "cur_dialog" in data["users"][user]["rooms"][room] and typing_event["id"]==data["users"][user]["rooms"][room]["cur_dialog"]["id"]:
+                if send_typing_event(room) == False:
+                  log.error("send_typing_event")
+
+        if "conversations" not in res:
+          continue
+
         conversations=res["conversations"]
         for m in res["messages"]:
           log.debug("Receive message from VK:")
@@ -3110,7 +3323,7 @@ def vk_receiver_thread(user):
                   # Ищем отправителя в профилях полученного сообщения:
                   for profile in res["profiles"]:
                     if profile["id"]==m["from_id"]:
-                      sender_name="%s %s"%(profile["first_name"],profile["last_name"])
+                      sender_name="<a href='https://vk.com/id%s'>%s %s </a>"%(profile["id"],profile["first_name"],profile["last_name"])
                 if proccess_vk_message(bot_control_room,room,user,sender_name,m) == False:
                   log.warning("proccess_vk_message(room=%s) return false"%(room))
                 # комнату нашли и сообщение в неё отправили - нет смысла перебирать оставшиеся комнаты
@@ -3180,7 +3393,7 @@ def vk_receiver_thread(user):
               log.debug("try find user id = %d in profiles"%m["peer_id"])
               for profile in res["profiles"]:
                 if profile["peer_id"]==m["peer_id"]:
-                  sender_name="<strong>%s %s:</strong> "%(profile["first_name"],profile["last_name"])
+                  sender_name="[%s]<strong>%s %s:</strong> "%(m["id"],profile["first_name"],profile["last_name"])
               if sender_name == None:
                 log.warning("not found sender_name in profiles. Profiles was:")
                 log.debug(json.dumps(res["profiles"], indent=4, sort_keys=True,ensure_ascii=False))
@@ -3229,14 +3442,24 @@ def get_name_of_matrix_room(room_id):
     log.error("error get name of MATRIX room: %s"%room_id)
     return None
 
-def vk_get_user_photo_url(session, user_id):
+def vk_get_user_photo_url(session, chat_id):
   global log
   try:
     log.debug("=start function=")
     api = vk.API(session, v=VK_API_VERSION)
-    response=api.users.get(user_ids="%d"%user_id,fields="photo_max")
-    url=response[0]["photo_max"]
-    log.debug(json.dumps(response, indent=4, sort_keys=True,ensure_ascii=False))
+    if chat_id<2000000000 and chat_id>0: #Если это ЛС
+      response=api.users.get(user_ids="%d"%chat_id,fields="photo_max")
+      url=response[0]["photo_max"]
+      log.debug(json.dumps(response, indent=4, sort_keys=True,ensure_ascii=False))
+    if chat_id>2000000000: #Если это групповой чат
+      response=api.messages.getChat(chat_id="%d"%(chat_id-2000000000))
+      url=response["photo_200"]
+      log.debug(json.dumps(response, indent=4, sort_keys=True,ensure_ascii=False))
+    if chat_id<0: #Если это сообщество
+      response=api.groups.getById(group_id="%d"%(chat_id*-1))
+      log.debug(json.dumps(response, indent=4, sort_keys=True,ensure_ascii=False))
+      url=response[0]["photo_200"]
+
   except Exception as e:
     log.error(get_exception_traceback_descr(e))
     log.error("exception at execute vk_get_user_photo()")
